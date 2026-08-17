@@ -1,7 +1,7 @@
 defmodule DBConnection.Connection do
   @moduledoc false
 
-  @behaviour :gen_statem
+  use GenServer
 
   require Logger
   alias DBConnection.Backoff
@@ -14,7 +14,7 @@ defmodule DBConnection.Connection do
   def start_link(mod, opts, pool, tag) do
     start_opts = Keyword.take(opts, [:debug, :spawn_opt])
     sensitive_options = %DBConnection.SensitiveData{data: opts}
-    :gen_statem.start_link(__MODULE__, {mod, sensitive_options, pool, tag}, start_opts)
+    GenServer.start_link(__MODULE__, {mod, sensitive_options, pool, tag}, start_opts)
   end
 
   @doc false
@@ -27,27 +27,20 @@ defmodule DBConnection.Connection do
 
   @doc false
   def disconnect({pid, ref}, err, state) do
-    :gen_statem.cast(pid, {:disconnect, ref, err, state})
+    GenServer.cast(pid, {:disconnect, ref, err, state})
   end
 
   @doc false
   def stop({pid, ref}, err, state) do
-    :gen_statem.cast(pid, {:stop, ref, err, state})
+    GenServer.cast(pid, {:stop, ref, err, state})
   end
 
   @doc false
   def ping({pid, ref}, state) do
-    :gen_statem.cast(pid, {:ping, ref, state})
+    GenServer.cast(pid, {:ping, ref, state})
   end
 
-  ## gen_statem API
-
-  @doc false
-  @impl :gen_statem
-  def callback_mode, do: :handle_event_function
-
-  @doc false
-  @impl :gen_statem
+  @impl GenServer
   def init({mod, %DBConnection.SensitiveData{data: opts}, pool, tag}) do
     pool_index = Keyword.get(opts, :pool_index)
     label = if pool_index, do: "db_conn_#{pool_index}", else: "db_conn"
@@ -61,6 +54,7 @@ defmodule DBConnection.Connection do
       pool: pool,
       tag: tag,
       timer: nil,
+      backoff_ref: nil,
       connected_at: nil,
       backoff: Backoff.new(opts),
       connection_listeners: Keyword.get(opts, :connection_listeners, []),
@@ -68,13 +62,11 @@ defmodule DBConnection.Connection do
       after_connect_timeout: Keyword.get(opts, :after_connect_timeout, @timeout)
     }
 
-    {:ok, :no_state, s, {:next_event, :internal, {:connect, :init}}}
+    {:ok, s, {:continue, {:connect, :init}}}
   end
 
-  @impl :gen_statem
-  def handle_event(type, info, state, s)
-
-  def handle_event(:internal, {:connect, _info}, :no_state, s) do
+  @impl GenServer
+  def handle_continue({:connect, _info}, s) do
     %{mod: mod, opts: opts, backoff: backoff, after_connect: after_connect} = s
 
     try do
@@ -87,16 +79,19 @@ defmodule DBConnection.Connection do
       {:ok, state} when after_connect != nil ->
         ref = make_ref()
         connected_at = System.monotonic_time()
-        :gen_statem.cast(self(), {:after_connect, ref})
-        {:keep_state, %{s | state: state, client: {ref, :connect}, connected_at: connected_at}}
+        GenServer.cast(self(), {:after_connect, ref})
+        s = cancel_backoff(s)
+
+        {:noreply, %{s | state: state, client: {ref, :connect}, connected_at: connected_at}}
 
       {:ok, state} ->
         backoff = backoff && Backoff.reset(backoff)
         ref = make_ref()
         connected_at = System.monotonic_time()
-        :gen_statem.cast(self(), {:connected, ref})
+        GenServer.cast(self(), {:connected, ref})
+        s = cancel_backoff(s)
 
-        {:keep_state,
+        {:noreply,
          %{
            s
            | state: state,
@@ -135,12 +130,11 @@ defmodule DBConnection.Connection do
           crash_reason: {err, []}
         )
 
-        {timeout, backoff} = Backoff.backoff(backoff)
-        {:keep_state, %{s | backoff: backoff}, {{:timeout, :backoff}, timeout, nil}}
+        {:noreply, schedule_backoff(s)}
     end
   end
 
-  def handle_event(:internal, {:disconnect, {log, err}}, :no_state, %{mod: mod} = s) do
+  def handle_continue({:disconnect, {log, err}}, %{mod: mod} = s) do
     if log == :log do
       severity =
         case err do
@@ -174,33 +168,29 @@ defmodule DBConnection.Connection do
         {:stop, {:shutdown, err}, s}
 
       {_, :after_connect} ->
-        {timeout, backoff} = Backoff.backoff(backoff)
-        {:keep_state, %{s | backoff: backoff}, {{:timeout, :backoff}, timeout, nil}}
+        {:noreply, schedule_backoff(s)}
 
       _ ->
-        {:keep_state, s, {:next_event, :internal, {:connect, :disconnect}}}
+        {:noreply, s, {:continue, {:connect, :disconnect}}}
     end
   end
 
-  def handle_event({:timeout, :backoff}, _content, :no_state, s) do
-    {:keep_state, s, {:next_event, :internal, {:connect, :backoff}}}
-  end
-
-  def handle_event(:cast, {:ping, ref, state}, :no_state, %{client: {ref, :pool}, mod: mod} = s) do
+  @impl GenServer
+  def handle_cast({:ping, ref, state}, %{client: {ref, :pool}, mod: mod} = s) do
     case apply(mod, :ping, [state]) do
       {:ok, state} ->
         pool_update(state, s)
 
       {:disconnect, err, state} ->
-        {:keep_state, %{s | state: state}, {:next_event, :internal, {:disconnect, {:log, err}}}}
+        {:noreply, %{s | state: state}, {:continue, {:disconnect, {:log, err}}}}
     end
   end
 
-  def handle_event(:cast, {:disconnect, ref, err, state}, :no_state, %{client: {ref, _}} = s) do
-    {:keep_state, %{s | state: state}, {:next_event, :internal, {:disconnect, {:log, err}}}}
+  def handle_cast({:disconnect, ref, err, state}, %{client: {ref, _}} = s) do
+    {:noreply, %{s | state: state}, {:continue, {:disconnect, {:log, err}}}}
   end
 
-  def handle_event(:cast, {:stop, ref, err, state}, :no_state, %{client: {ref, _}} = s) do
+  def handle_cast({:stop, ref, err, state}, %{client: {ref, _}} = s) do
     {_, stack} = :erlang.process_info(self(), :current_stacktrace)
 
     case err do
@@ -228,11 +218,11 @@ defmodule DBConnection.Connection do
     {:stop, {err, stack}, %{s | state: state}}
   end
 
-  def handle_event(:cast, {tag, _, _, _}, :no_state, s) when tag in [:disconnect, :stop] do
-    handle_timeout(s)
+  def handle_cast({tag, _, _, _}, s) when tag in [:disconnect, :stop] do
+    {:noreply, s}
   end
 
-  def handle_event(:cast, {:after_connect, ref}, :no_state, %{client: {ref, :connect}} = s) do
+  def handle_cast({:after_connect, ref}, %{client: {ref, :connect}} = s) do
     %{
       mod: mod,
       state: state,
@@ -249,18 +239,18 @@ defmodule DBConnection.Connection do
         {pid, ref} = DBConnection.Task.run_child(mod, state, after_connect, opts)
         timer = start_timer(pid, timeout)
         s = %{s | client: {ref, :after_connect}, timer: timer, state: state}
-        {:keep_state, s}
+        {:noreply, s}
 
       {:disconnect, err, state} ->
-        {:keep_state, %{s | state: state}, {:next_event, :internal, {:disconnect, {:log, err}}}}
+        {:noreply, %{s | state: state}, {:continue, {:disconnect, {:log, err}}}}
     end
   end
 
-  def handle_event(:cast, {:after_connect, _}, :no_state, _s) do
-    :keep_state_and_data
+  def handle_cast({:after_connect, _}, s) do
+    {:noreply, s}
   end
 
-  def handle_event(:cast, {:connected, ref}, :no_state, %{client: {ref, :connect}} = s) do
+  def handle_cast({:connected, ref}, %{client: {ref, :connect}} = s) do
     %{mod: mod, state: state} = s
 
     notify_connection_listeners(:connected, s)
@@ -270,45 +260,39 @@ defmodule DBConnection.Connection do
         pool_update(state, s)
 
       {:disconnect, err, state} ->
-        {:keep_state, %{s | state: state}, {:next_event, :internal, {:disconnect, {:log, err}}}}
+        {:noreply, %{s | state: state}, {:continue, {:disconnect, {:log, err}}}}
     end
   end
 
-  def handle_event(:cast, {:connected, _}, :no_state, _s) do
-    :keep_state_and_data
+  def handle_cast({:connected, _}, s) do
+    {:noreply, s}
   end
 
-  def handle_event(
-        :info,
-        {:DOWN, ref, _, pid, reason},
-        :no_state,
-        %{client: {ref, :after_connect}} = s
-      ) do
+  @impl GenServer
+  def handle_info(:backoff, s) do
+    {:noreply, %{s | backoff_ref: nil}, {:continue, {:connect, :backoff}}}
+  end
+
+  def handle_info({:DOWN, ref, _, pid, reason}, %{client: {ref, :after_connect}} = s) do
     message =
       "client #{Util.inspect_pid(pid)} exited: " <> Exception.format_exit(reason)
 
     err = DBConnection.ConnectionError.exception(message)
 
-    {:keep_state, %{s | client: {nil, :after_connect}},
-     {:next_event, :internal, {:disconnect, {down_log(reason), err}}}}
+    {:noreply, %{s | client: {nil, :after_connect}},
+     {:continue, {:disconnect, {down_log(reason), err}}}}
   end
 
-  def handle_event(:info, {:DOWN, mon, _, pid, reason}, :no_state, %{client: {ref, mon}} = s) do
+  def handle_info({:DOWN, mon, _, pid, reason}, %{client: {ref, mon}} = s) do
     message =
       "client #{Util.inspect_pid(pid)} exited: " <> Exception.format_exit(reason)
 
     err = DBConnection.ConnectionError.exception(message)
 
-    {:keep_state, %{s | client: {ref, nil}},
-     {:next_event, :internal, {:disconnect, {down_log(reason), err}}}}
+    {:noreply, %{s | client: {ref, nil}}, {:continue, {:disconnect, {down_log(reason), err}}}}
   end
 
-  def handle_event(
-        :info,
-        {:timeout, timer, {__MODULE__, pid, timeout}},
-        :no_state,
-        %{timer: timer} = s
-      )
+  def handle_info({:timeout, timer, {__MODULE__, pid, timeout}}, %{timer: timer} = s)
       when is_reference(timer) do
     message =
       "client #{Util.inspect_pid(pid)} timed out because it checked out " <>
@@ -326,13 +310,11 @@ defmodule DBConnection.Connection do
       end
       |> DBConnection.ConnectionError.exception()
 
-    {:keep_state, %{s | timer: nil}, {:next_event, :internal, {:disconnect, {:log, exc}}}}
+    {:noreply, %{s | timer: nil}, {:continue, {:disconnect, {:log, exc}}}}
   end
 
-  def handle_event(
-        :info,
+  def handle_info(
         {:"ETS-TRANSFER", holder, _pid, {msg, ref, extra}},
-        :no_state,
         %{client: {ref, :after_connect}, timer: timer} = s
       ) do
     {_, state} = Holder.delete(holder)
@@ -341,31 +323,27 @@ defmodule DBConnection.Connection do
 
     case msg do
       :checkin -> handle_checkin(state, s)
-      :disconnect -> handle_event(:cast, {:disconnect, ref, extra, state}, :no_state, s)
-      :stop -> handle_event(:cast, {:stop, ref, extra, state}, :no_state, s)
+      :disconnect -> handle_cast({:disconnect, ref, extra, state}, s)
+      :stop -> handle_cast({:stop, ref, extra, state}, s)
     end
   end
 
-  # We discard EXIT messages which may arrive if the process is trapping exits
-  def handle_event(:info, {:EXIT, _, _}, :no_state, s) do
-    handle_timeout(s)
+  def handle_info({:EXIT, _, _}, s) do
+    {:noreply, s}
   end
 
-  def handle_event(:info, msg, :no_state, %{mod: mod} = s) do
+  def handle_info(msg, %{mod: mod} = s) do
     Logger.info(fn ->
       [inspect(mod), ?\s, ?(, Util.inspect_pid(self()), ") missed message: " | inspect(msg)]
     end)
 
-    handle_timeout(s)
+    {:noreply, s}
   end
 
-  @doc false
-  @impl :gen_statem
-  # If client is :closed then the connection was previously disconnected
-  # and cleanup is not required.
-  def terminate(_, _, %{client: :closed}), do: :ok
+  @impl GenServer
+  def terminate(_reason, %{client: :closed}), do: :ok
 
-  def terminate(reason, _, s) do
+  def terminate(reason, s) do
     %{mod: mod, state: state} = s
     msg = "connection exited: " <> Exception.format_exit(reason)
 
@@ -374,16 +352,16 @@ defmodule DBConnection.Connection do
     |> mod.disconnect(state)
   end
 
-  @doc false
-  @impl :gen_statem
-  def format_status(info, [_, :no_state, %{client: :closed, mod: mod}]) do
-    case info do
-      :normal -> [{:data, [{~c"Module", mod}]}]
-      :terminate -> mod
-    end
+  @impl GenServer
+  def format_status(:normal, [_pdict, %{client: :closed, mod: mod}]) do
+    [{:data, [{~c"Module", mod}]}]
   end
 
-  def format_status(info, [pdict, :no_state, %{mod: mod, state: state}]) do
+  def format_status(:terminate, [_pdict, %{client: :closed, mod: mod}]) do
+    mod
+  end
+
+  def format_status(info, [pdict, %{mod: mod, state: state}]) do
     case function_exported?(mod, :format_status, 2) do
       true when info == :normal ->
         normal_status(mod, pdict, state)
@@ -398,8 +376,6 @@ defmodule DBConnection.Connection do
         {mod, state}
     end
   end
-
-  ## Helpers
 
   defp maybe_sanitize_exception(e, stack, opts) do
     if Keyword.get(opts, :show_sensitive_data_on_connection_error, false) do
@@ -435,8 +411,6 @@ defmodule DBConnection.Connection do
   defp down_log(:shutdown), do: :nolog
   defp down_log({:shutdown, _}), do: :nolog
   defp down_log(_), do: :log
-
-  defp handle_timeout(s), do: {:keep_state, s}
 
   defp demonitor({_, mon}) when is_reference(mon) do
     Process.demonitor(mon, [:flush])
@@ -474,6 +448,20 @@ defmodule DBConnection.Connection do
     end
   end
 
+  defp schedule_backoff(%{backoff: backoff} = s) do
+    {timeout, backoff} = Backoff.backoff(backoff)
+    s = cancel_backoff(s)
+    ref = Process.send_after(self(), :backoff, timeout)
+    %{s | backoff: backoff, backoff_ref: ref}
+  end
+
+  defp cancel_backoff(%{backoff_ref: ref} = s) when is_reference(ref) do
+    _ = Process.cancel_timer(ref)
+    %{s | backoff_ref: nil}
+  end
+
+  defp cancel_backoff(s), do: s
+
   defp handle_checkin(state, s) do
     %{backoff: backoff, client: client} = s
     backoff = backoff && Backoff.reset(backoff)
@@ -484,7 +472,7 @@ defmodule DBConnection.Connection do
   defp pool_update(state, %{pool: pool, tag: tag, mod: mod, connected_at: connected_at} = s) do
     case Holder.update(pool, tag, mod, state, connected_at) do
       {:ok, ref} ->
-        {:keep_state, %{s | client: {ref, :pool}, state: state}, :hibernate}
+        {:noreply, %{s | client: {ref, :pool}, state: state}}
 
       :error ->
         {:stop, {:shutdown, :no_more_pool}, s}
