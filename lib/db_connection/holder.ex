@@ -15,7 +15,8 @@ defmodule DBConnection.Holder do
     :lock,
     :connected_at,
     deadline: nil,
-    status: :ok
+    status: :ok,
+    owner: nil
   ])
 
   Record.defrecord(:pool_ref, [:pool, :reference, :deadline, :holder, :lock])
@@ -28,13 +29,21 @@ defmodule DBConnection.Holder do
   @spec new(pid, reference, module, term) :: t
   @spec new(pid, reference, module, term, integer) :: t
   def new(pool, ref, mod, state, connected_at \\ System.monotonic_time()) do
-    # Insert before setting heir so that pool can't receive empty table
-    holder = :ets.new(__MODULE__, [:public, :ordered_set, decentralized_counters: true])
+    # Insert before setting heir so that pool can't receive empty table.
+    # AtomVM has no ordered_set; this table holds a single :conn row so :set is enough.
+    holder = :ets.new(__MODULE__, [:public, :set, decentralized_counters: true])
 
-    conn = conn(connection: self(), module: mod, state: state, connected_at: connected_at)
+    conn =
+      conn(
+        connection: self(),
+        module: mod,
+        state: state,
+        connected_at: connected_at,
+        owner: self()
+      )
+
     true = :ets.insert_new(holder, conn)
-
-    :ets.setopts(holder, {:heir, pool, ref})
+    maybe_set_heir(holder, pool, ref)
     holder
   end
 
@@ -44,7 +53,7 @@ defmodule DBConnection.Holder do
     holder = new(pool, ref, mod, state, connected_at)
 
     try do
-      :ets.give_away(holder, pool, {:checkin, ref, System.monotonic_time()})
+      transfer(holder, pool, {:checkin, ref, System.monotonic_time()})
       {:ok, holder}
     rescue
       ArgumentError -> :error
@@ -207,12 +216,25 @@ defmodule DBConnection.Holder do
     :ok
   end
 
+  @spec owner(t) :: pid | :undefined
+  def owner(holder) do
+    if function_exported?(:ets, :info, 2) do
+      :ets.info(holder, :owner)
+    else
+      try do
+        :ets.lookup_element(holder, :conn, conn(:owner) + 1)
+      rescue
+        ArgumentError -> :undefined
+      end
+    end
+  end
+
   @spec handle_checkout(t, {pid, reference}, reference, checkin_time) :: boolean
   def handle_checkout(holder, {pid, mref}, ref, checkin_time) do
-    :ets.give_away(holder, pid, {mref, ref, checkin_time})
+    transfer(holder, pid, {mref, ref, checkin_time})
   rescue
     ArgumentError ->
-      if Process.alive?(pid) or :ets.info(holder, :owner) != self() do
+      if Process.alive?(pid) or owner(holder) != self() do
         raise ArgumentError, no_holder(holder, pid)
       else
         false
@@ -362,7 +384,7 @@ defmodule DBConnection.Holder do
 
   defp no_holder(holder, maybe_pid) do
     reason =
-      case :ets.info(holder, :owner) do
+      case owner(holder) do
         :undefined -> "does not exist"
         ^maybe_pid -> "is being given to its current owner"
         owner when owner != self() -> "does not belong to the giving process"
@@ -382,7 +404,7 @@ defmodule DBConnection.Holder do
     #{call_reason}.
 
     SELF: #{Util.inspect_pid(self())}
-    ETS INFO: #{inspect(:ets.info(holder))}
+    ETS INFO: #{inspect(ets_info(holder))}
 
     Please report at https://github.com/elixir-ecto/db_connection/issues"
     """
@@ -431,7 +453,7 @@ defmodule DBConnection.Holder do
 
     try do
       :ets.update_element(holder, :conn, [{conn(:deadline) + 1, nil} | ops])
-      :ets.give_away(holder, pool, {tag, ref, info})
+      transfer(holder, pool, {tag, ref, info})
     rescue
       ArgumentError -> :ok
     else
@@ -484,5 +506,37 @@ defmodule DBConnection.Holder do
     pid = :ets.lookup_element(holder, :conn, conn(:connection) + 1)
     hash = :erlang.phash2(pid, interval_ms)
     System.convert_time_unit(hash, :millisecond, :native)
+  end
+
+  defp maybe_set_heir(holder, pool, ref) do
+    if function_exported?(:ets, :setopts, 2) do
+      :ets.setopts(holder, {:heir, pool, ref})
+    else
+      :ok
+    end
+  end
+
+  defp transfer(table, pid, gift_data) do
+    if function_exported?(:ets, :give_away, 3) do
+      :ets.give_away(table, pid, gift_data)
+    else
+      _ = put_owner(table, pid)
+      send(pid, {:"ETS-TRANSFER", table, self(), gift_data})
+      true
+    end
+  end
+
+  defp put_owner(table, pid) do
+    :ets.update_element(table, :conn, {conn(:owner) + 1, pid})
+  rescue
+    ArgumentError -> false
+  end
+
+  defp ets_info(holder) do
+    if function_exported?(:ets, :info, 1) do
+      :ets.info(holder)
+    else
+      %{owner: owner(holder)}
+    end
   end
 end
