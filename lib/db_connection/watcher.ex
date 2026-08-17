@@ -24,7 +24,7 @@ defmodule DBConnection.Watcher do
 
   @impl true
   def handle_call({:watch, supervisor, args}, {caller_pid, _ref}, {caller_refs, started_refs}) do
-    case DynamicSupervisor.start_child(supervisor, args) do
+    case DBConnection.DynamicSupervisor.start_child(supervisor, args) do
       {:ok, started_pid} ->
         Process.link(caller_pid)
         caller_ref = Process.monitor(caller_pid)

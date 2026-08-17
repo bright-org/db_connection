@@ -258,7 +258,7 @@ defmodule DBConnection.Ownership.Manager do
     %{pool: pool, checkouts: checkouts, owners: owners, ets: ets, log: log, mode: mode} = state
 
     {:ok, proxy} =
-      DynamicSupervisor.start_child(
+      DBConnection.DynamicSupervisor.start_child(
         DBConnection.Ownership.Supervisor,
         {DBConnection.Ownership.Proxy, {caller, pool, opts}}
       )
