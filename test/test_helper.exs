@@ -5,3 +5,7 @@ Code.require_file("test_support.exs", __DIR__)
 defmodule TestPool do
   use TestConnection, pool: DBConnection.ConnectionPool, pool_size: 1
 end
+
+defmodule TestSingleConnection do
+  use TestConnection, pool: DBConnection.SingleConnection, pool_size: 1
+end
