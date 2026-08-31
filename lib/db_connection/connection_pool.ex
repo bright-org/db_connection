@@ -161,7 +161,7 @@ defmodule DBConnection.ConnectionPool do
       :checkin ->
         owner = self()
 
-        case :ets.info(holder, :owner) do
+        case Holder.owner(holder) do
           ^owner ->
             {interval, max_lifetime} = ts
 
