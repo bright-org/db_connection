@@ -76,6 +76,8 @@ defmodule DBConnection do
   DBConnection connections support using different pools via the `:pool` option
   passed to `start_link/2`. The default pool is `DBConnection.ConnectionPool`.
   Another supported pool that is commonly used for tests is `DBConnection.Ownership`.
+  `DBConnection.SingleConnection` is a one-connection pool without CoDel
+  queueing or `DynamicSupervisor`, intended for constrained runtimes.
 
   For now, using *custom* pools is not supported since the API for pools is not
   public.

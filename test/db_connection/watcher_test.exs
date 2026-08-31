@@ -29,7 +29,7 @@ defmodule DBConnection.WatcherTest do
     # Find the pool sup for pool1 by matching the owner pid in child spec ids.
     pool_sup_ref =
       DBConnection.ConnectionPool.Supervisor
-      |> DynamicSupervisor.which_children()
+      |> DBConnection.DynamicSupervisor.which_children()
       |> Enum.find_value(fn {_, sup_pid, _, _} ->
         try do
           has_pool1? =
@@ -54,7 +54,7 @@ defmodule DBConnection.WatcherTest do
         C.start_link(agent: agent2, pool_size: 1, idle_interval: 100_000)
       end)
 
-    # If the DynamicSupervisor or the watcher is blocked, this hangs
+    # If the supervisor or the watcher is blocked, this hangs
     assert {:ok, _pool2} = Task.await(task, 1_000)
 
     # Ensure the pool supervisor actually terminates
