@@ -1,7 +1,7 @@
-defmodule DBConnection.SingleConnectionTest do
+defmodule DBConnection.ConnectionPoolTest do
   use ExUnit.Case, async: true
 
-  alias TestSingleConnection, as: P
+  alias TestPool, as: P
   alias TestAgent, as: A
   alias TestQuery, as: Q
   alias TestResult, as: R
