@@ -6,7 +6,9 @@ defmodule DBConnection.Holder do
 
   @queue true
   @timeout 15000
-  @time_unit 1000
+  # AtomVM System.monotonic_time/1 only accepts atom units (:millisecond etc.),
+  # not integer "parts per second" like 1000.
+  @time_unit :millisecond
 
   Record.defrecord(:conn, [
     :connection,
@@ -16,7 +18,10 @@ defmodule DBConnection.Holder do
     :connected_at,
     deadline: nil,
     status: :ok,
-    owner: nil
+    owner: nil,
+    heir_pid: nil,
+    heir_data: nil,
+    client_mon: nil
   ])
 
   Record.defrecord(:pool_ref, [:pool, :reference, :deadline, :holder, :lock])
@@ -39,7 +44,9 @@ defmodule DBConnection.Holder do
         module: mod,
         state: state,
         connected_at: connected_at,
-        owner: self()
+        owner: self(),
+        heir_pid: pool,
+        heir_data: ref
       )
 
     true = :ets.insert_new(holder, conn)
@@ -218,15 +225,63 @@ defmodule DBConnection.Holder do
 
   @spec owner(t) :: pid | :undefined
   def owner(holder) do
-    if function_exported?(:ets, :info, 2) do
-      :ets.info(holder, :owner)
-    else
-      try do
-        :ets.lookup_element(holder, :conn, conn(:owner) + 1)
-      rescue
-        ArgumentError -> :undefined
-      end
+    soft_owner(holder)
+  end
+
+  @doc false
+  @spec watch_client(t, pid) :: reference | nil
+  def watch_client(holder, client_pid) when is_pid(client_pid) do
+    mon = Process.monitor(client_pid)
+    true = :ets.update_element(holder, :conn, {conn(:client_mon) + 1, mon})
+    mon
+  rescue
+    ArgumentError -> nil
+  end
+
+  @doc false
+  @spec unwatch_client(t) :: :ok
+  def unwatch_client(holder) do
+    case soft_client_mon(holder) do
+      mon when is_reference(mon) ->
+        Process.demonitor(mon, [:flush])
+        _ = :ets.update_element(holder, :conn, {conn(:client_mon) + 1, nil})
+        :ok
+
+      _ ->
+        :ok
     end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc false
+  @spec reclaim_on_client_down(t, pid) :: boolean
+  def reclaim_on_client_down(holder, client_pid) when is_pid(client_pid) do
+    case :ets.lookup(holder, :conn) do
+      [
+        conn(
+          owner: ^client_pid,
+          heir_pid: heir_pid,
+          heir_data: heir_data,
+          client_mon: mon
+        )
+      ]
+      when is_pid(heir_pid) ->
+        if is_reference(mon), do: Process.demonitor(mon, [:flush])
+        _ = :ets.update_element(holder, :conn, {conn(:client_mon) + 1, nil})
+
+        if put_owner(holder, heir_pid) do
+          send(heir_pid, {:"ETS-TRANSFER", holder, client_pid, heir_data})
+          true
+        else
+          false
+        end
+
+      _ ->
+        false
+    end
+  rescue
+    ArgumentError -> false
   end
 
   @spec handle_checkout(t, {pid, reference}, reference, checkin_time) :: boolean
@@ -486,9 +541,9 @@ defmodule DBConnection.Holder do
   end
 
   defp start_deadline(timeout, pid, ref, holder, start) do
-    deadline =
-      :erlang.start_timer(timeout, pid, {ref, holder, self(), timeout - start}, abs: true)
-
+    now = System.monotonic_time(@time_unit)
+    delay = max(timeout - now, 0)
+    deadline = :erlang.start_timer(delay, pid, {ref, holder, self(), timeout - start})
     {deadline, [{conn(:deadline) + 1, deadline}]}
   end
 
@@ -497,7 +552,8 @@ defmodule DBConnection.Holder do
   end
 
   defp cancel_deadline(deadline) do
-    :erlang.cancel_timer(deadline, async: true, info: false)
+    _ = :erlang.cancel_timer(deadline)
+    :ok
   end
 
   defp hash_holder(_holder, 0), do: 0
@@ -508,21 +564,32 @@ defmodule DBConnection.Holder do
     System.convert_time_unit(hash, :millisecond, :native)
   end
 
-  defp maybe_set_heir(holder, pool, ref) do
-    if function_exported?(:ets, :setopts, 2) do
-      :ets.setopts(holder, {:heir, pool, ref})
-    else
-      :ok
-    end
-  end
+  defp maybe_set_heir(_holder, _pool, _ref), do: :ok
 
   defp transfer(table, pid, gift_data) do
-    if function_exported?(:ets, :give_away, 3) do
-      :ets.give_away(table, pid, gift_data)
-    else
-      _ = put_owner(table, pid)
-      send(pid, {:"ETS-TRANSFER", table, self(), gift_data})
-      true
+    soft_give_away(table, pid, gift_data)
+  end
+
+  # Approximate :ets.give_away/3 failure conditions so checkout/checkin
+  # rescue paths behave like OTP when give_away is missing.
+  defp soft_give_away(table, pid, gift_data) do
+    cond do
+      not is_pid(pid) or not Process.alive?(pid) ->
+        raise ArgumentError
+
+      pid == self() ->
+        raise ArgumentError
+
+      soft_owner(table) != self() ->
+        raise ArgumentError
+
+      true ->
+        if put_owner(table, pid) do
+          send(pid, {:"ETS-TRANSFER", table, self(), gift_data})
+          true
+        else
+          raise ArgumentError
+        end
     end
   end
 
@@ -532,11 +599,19 @@ defmodule DBConnection.Holder do
     ArgumentError -> false
   end
 
+  defp soft_owner(holder) do
+    :ets.lookup_element(holder, :conn, conn(:owner) + 1)
+  rescue
+    ArgumentError -> :undefined
+  end
+
+  defp soft_client_mon(holder) do
+    :ets.lookup_element(holder, :conn, conn(:client_mon) + 1)
+  rescue
+    ArgumentError -> nil
+  end
+
   defp ets_info(holder) do
-    if function_exported?(:ets, :info, 1) do
-      :ets.info(holder)
-    else
-      %{owner: owner(holder)}
-    end
+    %{owner: owner(holder)}
   end
 end
