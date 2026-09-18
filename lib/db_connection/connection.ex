@@ -207,12 +207,7 @@ defmodule DBConnection.Connection do
             _other -> "** #{inspect(err)}"
           end
 
-        format =
-          ~c"** State machine ~p terminating~n" ++
-            ~c"** Reason for termination ==~n" ++
-            ~c"~s~n"
-
-        :error_logger.format(format, [self(), reason])
+        :erlang.display({:db_connection_terminating, self(), reason})
     end
 
     {:stop, {err, stack}, %{s | state: state}}
@@ -472,6 +467,7 @@ defmodule DBConnection.Connection do
   defp pool_update(state, %{pool: pool, tag: tag, mod: mod, connected_at: connected_at} = s) do
     case Holder.update(pool, tag, mod, state, connected_at) do
       {:ok, ref} ->
+        # Omit :hibernate — AtomVM gen_server does not support it.
         {:noreply, %{s | client: {ref, :pool}, state: state}}
 
       :error ->
